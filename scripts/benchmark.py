@@ -1,7 +1,7 @@
 import torch
 import math
 import time
-from tqdm import tqdm
+import torch.nn.functional as F
 
 class Evaluator:
     def __init__(self, model, tokenizer):
@@ -9,12 +9,53 @@ class Evaluator:
         self.tokenizer = tokenizer
         self.device = model.device
 
+    def _sync_if_needed(self):
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+
     @torch.no_grad()
-    def calculate_ppl(self, input_ids):
-        # 计算 PPL (Perplexity)
-        outputs = self.model(input_ids, labels=input_ids)
-        loss = outputs.loss
-        return math.exp(loss.item())
+    def calculate_ppl(self, input_ids, step_size=1):
+        """
+        按自回归解码路径计算 PPL。
+
+        不能直接用 `model(input_ids, labels=input_ids)`：
+        那种整段前向虽然会返回被压缩后的 past_key_values，
+        但本次 logits 已经基于未压缩的注意力结果算完了，
+        因此不同 KV 压缩方法会得到几乎完全相同的 PPL。
+
+        这里改为逐步喂入 token / token chunk，并显式复用 past_key_values，
+        让后续 token 的预测真正受到 KV cache 压缩的影响。
+        """
+        if input_ids.dim() == 1:
+            input_ids = input_ids.unsqueeze(0)
+
+        total_tokens = input_ids.size(1) - 1
+
+        total_nll = 0.0
+        past_key_values = None
+
+        for start in range(0, total_tokens, step_size):
+            end = min(start + step_size, total_tokens)
+            input_chunk = input_ids[:, start:end]
+            target_chunk = input_ids[:, start + 1 : end + 1]
+
+            outputs = self.model(
+                input_chunk,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+
+            logits = outputs.logits
+            token_nll = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)),
+                target_chunk.reshape(-1),
+                reduction="sum",
+            )
+
+            total_nll += token_nll.item()
+            past_key_values = outputs.past_key_values
+
+        return math.exp(total_nll / total_tokens)
 
     def run_all(self, text, gen_length=50):
         input_ids = self.tokenizer.encode(text, return_tensors="pt").to(self.device)
@@ -22,11 +63,13 @@ class Evaluator:
         results = {}
 
         # 记录 TTFT (Time To First Token)
-        start_ttft = time.time()
+        self._sync_if_needed()
+        start_ttft = time.perf_counter()
         outputs = self.model(input_ids, use_cache=True)
+        self._sync_if_needed()
         next_token_logits = outputs.logits[:, -1, :]
         next_token = torch.argmax(next_token_logits, dim=-1)
-        ttft = time.time() - start_ttft
+        ttft = time.perf_counter() - start_ttft
 
         past_key_values = outputs.past_key_values   # outputs.past_key_values已包含生成的新token的信息
         current_input_ids = next_token.unsqueeze(0)
@@ -34,19 +77,21 @@ class Evaluator:
         # 记录 TPOT (Time Per Output Token)
         latencies = []
         for _ in range(gen_length):
-            start_step = time.time()
+            self._sync_if_needed()
+            start_step = time.perf_counter()
             
             outputs = self.model(
                 current_input_ids, 
                 past_key_values=past_key_values, 
                 use_cache=True
             )
+            self._sync_if_needed()
             
             next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1)
             past_key_values = outputs.past_key_values
             current_input_ids = next_token.unsqueeze(0)
             
-            latencies.append(time.time() - start_step)
+            latencies.append(time.perf_counter() - start_step)
 
         tpot = sum(latencies) / len(latencies)
         
@@ -54,12 +99,13 @@ class Evaluator:
         throughput = 1 / tpot
 
         # 计算 PPL (Perplexity)
-        # ppl = self.calculate_ppl(input_ids)
+        ppl = self.calculate_ppl(input_ids, step_size=1)
         
         results = {
             "TTFT (s)": round(ttft, 4),
             "TPOT (s/token)": round(tpot, 4),
             "Throughput (tokens/s)": round(throughput, 2),
+            "PPL": round(ppl, 4),
             "Context Length": seq_len
         }
         

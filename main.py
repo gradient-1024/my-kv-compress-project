@@ -1,5 +1,6 @@
 import torch
 import gc
+import statistics
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 
@@ -89,9 +90,67 @@ def get_clean_model(model_id, device):
     return model
 
 
+def summarize_runs(run_results):
+    metric_names = [
+        "TTFT (s)",
+        "TPOT (s/token)",
+        "Throughput (tokens/s)",
+        "PPL",
+    ]
+
+    summary = {}
+    for metric in metric_names:
+        values = [run[metric] for run in run_results]
+        summary[metric] = {
+            "mean": statistics.mean(values),
+            "std": statistics.stdev(values) if len(values) > 1 else 0.0,
+        }
+
+    summary["Context Length"] = run_results[0]["Context Length"]
+    summary["Repeats"] = len(run_results)
+    return summary
+
+
+def run_single_benchmark(model_id, device, tokenizer, test_text, compressor_factory, gen_length):
+    model = get_clean_model(model_id, device)
+    compressor = compressor_factory()
+
+    if compressor is not None:
+        apply_compression_patch(model, compressor)
+
+    evaluator = Evaluator(model, tokenizer)
+    results = evaluator.run_all(test_text, gen_length=gen_length)
+
+    del model
+    del evaluator
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    return results
+
+
+def fetch_test_text(loader, tokenizer, context_length):
+    if isinstance(loader, PG19StreamLoader):
+        return loader.fetch_chunk_by_index(
+            index=0,
+            tokenizer=tokenizer,
+            max_tokens=context_length,
+        )
+
+    return loader.fetch_chunk(
+        tokenizer=tokenizer,
+        max_tokens=context_length,
+        start_token_idx=0,
+    )
+
+
 def main():
     model_id = "EleutherAI/pythia-70m"
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    benchmark_repeats = 1
+    gen_length = 50
+    discard_first_measurement = True
+    context_lengths = [2048, 3072]
     
     print(f"正在加载模型环境: {model_id} 到 {device}...")
     tokenizer = AutoTokenizer.from_pretrained(model_id)
@@ -104,7 +163,7 @@ def main():
         warmup_model = get_clean_model(model_id, device)
         
         # 构造长度为 1600 的无意义文本
-        dummy_text = "test " * 1600 
+        dummy_text = "test " * 2048
         warmup_evaluator = Evaluator(warmup_model, tokenizer)
         
         with torch.no_grad():
@@ -138,54 +197,86 @@ def main():
         print(f"开始在数据集 [{dataset_name}] 上进行基准测试")
         print("="*70)
 
-        # 获取测试文本
-        if isinstance(loader, PG19StreamLoader):
-            test_text = loader.fetch_chunk_by_index(index=0, tokenizer=tokenizer, max_tokens=1500)
-        else:
-            test_text = loader.fetch_chunk(tokenizer=tokenizer, max_tokens=1500, start_token_idx=0)
-
-        # 每次数据集测试前重新实例化压缩器，确保状态重置
+        # 用工厂函数确保每次重复实验都拿到全新的压缩器实例
         algorithms = {
-            "1. Baseline (Dense)": None,
-            "2. StreamingLLM (Cap=512)": StreamingLLMCompressor(window_size=508, sink_size=4),
-            "3. H2O (Cap=512)": H2OCompressor(max_capacity=512, window_size=32, sink_size=4),
-            "4. SnapKV (Ratio=0.5)": SnapKVCompressor(compression_ratio=0.5, window_size=32, kernel_size=5, sink_size=4),
+            "1. Baseline (Dense)": lambda: None,
+            "2. StreamingLLM (Cap=512)": lambda: StreamingLLMCompressor(window_size=508, sink_size=4),
+            "3. H2O (Cap=512)": lambda: H2OCompressor(max_capacity=512, window_size=32, sink_size=4),
+            "4. SnapKV (Ratio=0.5)": lambda: SnapKVCompressor(compression_ratio=0.5, window_size=32, kernel_size=5, sink_size=4),
         }
 
         dataset_results = {}
 
-        # 3. 内层循环：遍历并测试不同压缩算法
-        for algo_name, compressor in algorithms.items():
-            print("\n" + "-"*50)
-            print(f"当前评估算法: {algo_name}")
-            print("-"*50)
-            
-            # 获取初始模型
-            model = get_clean_model(model_id, device)
-            
-            # 应用对应的压缩补丁
-            if compressor is not None:
-                apply_compression_patch(model, compressor)
-                
-            # 执行评估
-            evaluator = Evaluator(model, tokenizer)
-            try:
-                # 统一生成 50 个 Token 用于测试吞吐量
-                results = evaluator.run_all(test_text, gen_length=50)
-                dataset_results[algo_name] = results
-                
-                # 输出当前算法测试结果
-                for key, value in results.items():
-                    print(f"{key:25}: {value}")
-                    
-            except Exception as e:
-                print(f"算法 {algo_name} 测试异常: {e}")
-                
-            # 清理显存以防止内存溢出 (OOM)
-            del model
-            del evaluator
-            gc.collect()
-            torch.cuda.empty_cache()
+        for context_length in context_lengths:
+            print("\n" + "~"*70)
+            print(f"当前上下文长度: {context_length} tokens")
+            print("~"*70)
+
+            test_text = fetch_test_text(loader, tokenizer, context_length)
+            context_results = {}
+
+            # 3. 内层循环：遍历并测试不同压缩算法
+            for algo_name, compressor_factory in algorithms.items():
+                print("\n" + "-"*50)
+                print(f"当前评估算法: {algo_name}")
+                print("-"*50)
+                run_results = []
+
+                for repeat_idx in range(benchmark_repeats):
+                    if discard_first_measurement:
+                        _ = run_single_benchmark(
+                            model_id=model_id,
+                            device=device,
+                            tokenizer=tokenizer,
+                            test_text=test_text,
+                            compressor_factory=compressor_factory,
+                            gen_length=gen_length,
+                        )
+                        discard_first_measurement = False
+
+                    print(f"重复测试 {repeat_idx + 1}/{benchmark_repeats}")
+
+                    results = run_single_benchmark(
+                        model_id=model_id,
+                        device=device,
+                        tokenizer=tokenizer,
+                        test_text=test_text,
+                        compressor_factory=compressor_factory,
+                        gen_length=gen_length,
+                    )
+                    run_results.append(results)
+
+                    print(
+                        "  "
+                        f"TTFT={results['TTFT (s)']:.4f}s | "
+                        f"TPOT={results['TPOT (s/token)']:.4f}s | "
+                        f"Throughput={results['Throughput (tokens/s)']:.2f} tk/s | "
+                        f"PPL={results['PPL']:.4f}"
+                    )
+
+                summary = summarize_runs(run_results)
+                context_results[algo_name] = summary
+
+                print("汇总统计:")
+                print(
+                    "  "
+                    f"TTFT={summary['TTFT (s)']['mean']:.4f} ± {summary['TTFT (s)']['std']:.4f} s"
+                )
+                print(
+                    "  "
+                    f"TPOT={summary['TPOT (s/token)']['mean']:.4f} ± {summary['TPOT (s/token)']['std']:.4f} s/token"
+                )
+                print(
+                    "  "
+                    f"Throughput={summary['Throughput (tokens/s)']['mean']:.2f} ± "
+                    f"{summary['Throughput (tokens/s)']['std']:.2f} tk/s"
+                )
+                print(
+                    "  "
+                    f"PPL={summary['PPL']['mean']:.4f} ± {summary['PPL']['std']:.4f}"
+                )
+
+            dataset_results[context_length] = context_results
             
         # 记录当前数据集测试结果
         super_results[dataset_name] = dataset_results
@@ -199,18 +290,27 @@ def main():
     # 遍历打印每个数据集的测试数据
     for dataset_name, dataset_results in super_results.items():
         print(f"\n数据集: {dataset_name}")
-        print("-" * 90)
-        print(f"{'Algorithm':<25} | {'TTFT (s)':<10} | {'TPOT (s/token)':<15} | {'Throughput (tk/s)':<18} ")
-        print("-" * 90)
-        
-        for name, res in dataset_results.items():
-            ttft = f"{res['TTFT (s)']:.4f}"
-            tpot = f"{res['TPOT (s/token)']:.4f}"
-            tput = f"{res['Throughput (tokens/s)']:.2f}"
+        for context_length, context_results in dataset_results.items():
+            print(f"\nContext Length: {context_length}")
+            print("-" * 132)
+            print(
+                f"{'Algorithm':<25} | {'TTFT mean±std (s)':<22} | "
+                f"{'TPOT mean±std (s/token)':<27} | {'Throughput mean±std (tk/s)':<29} | {'PPL mean±std':<18}"
+            )
+            print("-" * 132)
             
-            print(f"{name:<25} | {ttft:<10} | {tpot:<15} | {tput:<18} ")
+            for name, res in context_results.items():
+                ttft = f"{res['TTFT (s)']['mean']:.4f} ± {res['TTFT (s)']['std']:.4f}"
+                tpot = f"{res['TPOT (s/token)']['mean']:.4f} ± {res['TPOT (s/token)']['std']:.4f}"
+                tput = (
+                    f"{res['Throughput (tokens/s)']['mean']:.2f} ± "
+                    f"{res['Throughput (tokens/s)']['std']:.2f}"
+                )
+                ppl = f"{res['PPL']['mean']:.4f} ± {res['PPL']['std']:.4f}"
+                
+                print(f"{name:<25} | {ttft:<22} | {tpot:<27} | {tput:<29} | {ppl:<18}")
             
-    print("="*90)
+    print("="*132)
 
 if __name__ == "__main__":
     main()
