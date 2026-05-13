@@ -24,8 +24,9 @@ class StreamingLLMCompressor:
         return compressed_k, compressed_v
     
 class SnapKVCompressor:
-    def __init__(self, compression_ratio=0.5, window_size=32, kernel_size=5, sink_size=4):
+    def __init__(self, compression_ratio=0.5, max_capacity=None, window_size=32, kernel_size=5, sink_size=4):
         self.compression_ratio = compression_ratio
+        self.max_capacity = max_capacity
         self.window_size = window_size
         self.kernel_size = kernel_size
         self.sink_size = sink_size
@@ -35,7 +36,12 @@ class SnapKVCompressor:
         # key&value 维度: [batch, num_heads, seq_len, head_dim]
         batch, num_heads, seq_len, head_dim = key.shape
 
-        if self.computed_max_capacity is None or seq_len > self.computed_max_capacity + 1:
+        if self.max_capacity is not None:
+            self.computed_max_capacity = max(
+                self.max_capacity,
+                self.window_size + self.sink_size
+            )
+        elif self.computed_max_capacity is None or seq_len > self.computed_max_capacity + 1:
             self.computed_max_capacity = max(
                 int(seq_len * self.compression_ratio),
                 self.window_size + self.sink_size
@@ -134,34 +140,3 @@ class H2OCompressor:
         return k_hh, v_hh
 
 
-class PyramidKVCompressor:
-    def __init__(self, min_ratio=0.1, max_ratio=0.8, total_layers=24, max_cap=2048, window_size=32, sink_size=4):
-        self.min_ratio = min_ratio
-        self.max_ratio = max_ratio
-        # Pythia-70M：24层
-        self.total_layers = total_layers
-        self.window_size = window_size
-        self.sink_size = sink_size
-        self.max_cap = max_cap
-
-    def compress(self, key, value, layer_idx):
-        batch, num_heads, seq_len, head_dim = key.shape
-        ratio = self.max_ratio - (self.max_ratio - self.min_ratio) * (layer_idx / self.total_layers)
-        layer_capacity = max(int(seq_len * ratio), self.window_size + self.sink_size)
-        layer_capacity = min(layer_capacity, self.max_cap)
-        
-        if seq_len <= layer_capacity:
-            return key, value
-
-        k_sink = key[:, :, :self.sink_size, :]
-        v_sink = value[:, :, :self.sink_size, :]
-       
-        dynamic_window_size = layer_capacity - self.sink_size 
-
-        k_window = key[:, :, -dynamic_window_size:, :]
-        v_window = value[:, :, -dynamic_window_size:, :]
-
-        compressed_k = torch.concat([k_sink, k_window], dim=-2)
-        compressed_v = torch.concat([v_sink, v_window], dim=-2)
-
-        return compressed_k, compressed_v

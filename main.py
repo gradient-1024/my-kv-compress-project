@@ -4,12 +4,10 @@ import statistics
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 
-# 导入自定义压缩模块与评估模块
 from core.compressor import (
     StreamingLLMCompressor, 
     SnapKVCompressor, 
     H2OCompressor, 
-    PyramidKVCompressor
 )
 from core.patcher import apply_compression_patch
 from scripts.benchmark import Evaluator
@@ -48,24 +46,15 @@ class PG19StreamLoader:
 
 class WikitextLoader:
     def __init__(self, split="test", subset="wikitext-2-raw-v1"):
-        """
-        加载 Wikitext 数据集。
-        默认使用 wikitext-2-raw-v1 (未经过分词处理的原始文本)。
-        """
         print(f"加载 Wikitext ({subset} - {split}集) 数据")
-        # 静态加载 Wikitext 数据集
         self.dataset = load_dataset("wikitext", subset, split=split)
         
         self.full_text = "\n\n".join([item["text"] for item in self.dataset if item["text"].strip()])
         print(f"Wikitext 数据集加载完毕，总字符数: {len(self.full_text)}")
 
     def fetch_chunk(self, tokenizer, max_tokens=1500, start_token_idx=0):
-        """
-        按 Token 数量截取连续文本用于测试。
-        """
         tokens = tokenizer.encode(self.full_text)
         
-        # 截取指定范围的 Token
         end_idx = min(start_token_idx + max_tokens, len(tokens))
         chunked_tokens = tokens[start_token_idx:end_idx]
         
@@ -77,7 +66,6 @@ class WikitextLoader:
     
 
 def get_clean_model(model_id, device):
-    """每次测试前加载未被修改的初始模型"""
     model = AutoModelForCausalLM.from_pretrained(
         model_id, 
         torch_dtype=torch.float16 if device == "cuda" else torch.float32,
@@ -147,32 +135,28 @@ def fetch_test_text(loader, tokenizer, context_length):
 def main():
     model_id = "EleutherAI/pythia-70m"
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    benchmark_repeats = 1
+    benchmark_repeats = 3
     gen_length = 50
-    discard_first_measurement = True
-    context_lengths = [2048, 3072]
+    context_lengths = [1024, 2048, 3072, 4096]
+    compression_ratio = 0.5
+    sink_size = 4
+    window_size = 32
+    kernel_size = 5
     
     print(f"正在加载模型环境: {model_id} 到 {device}...")
     tokenizer = AutoTokenizer.from_pretrained(model_id)
 
     if device == "cuda":
-        print("\n" + "="*70)
+        print("\n")
         print("执行 CUDA 预热...")
-        print("="*70)
         
         warmup_model = get_clean_model(model_id, device)
         
-        # 构造长度为 1600 的无意义文本
         dummy_text = "test " * 2048
         warmup_evaluator = Evaluator(warmup_model, tokenizer)
         
         with torch.no_grad():
-            # 调用底层完整的评估管道。
-            # 设置 gen_length=1 即可触发完整的 Prefill 阶段与单步 Decoding 阶段，
-            # 从而遍历所有内存分配、算子寻优与上层对象初始化逻辑。
             _ = warmup_evaluator.run_all(dummy_text, gen_length=1)
-            
-            # 强制 CPU 等待 GPU 完成所有异步算子执行
             torch.cuda.synchronize()
             
         del warmup_model
@@ -188,52 +172,67 @@ def main():
         "Wikitext (Encyclopedia)": WikitextLoader(split="test", subset="wikitext-2-raw-v1")
     }
 
-    # 用于存储所有数据集的最终结果
     super_results = {}
 
-    # 2. 外层循环：遍历不同数据集
+    # 2. 遍历不同数据集
     for dataset_name, loader in data_loaders.items():
-        print("\n" + "="*70)
+        print("\n")
         print(f"开始在数据集 [{dataset_name}] 上进行基准测试")
-        print("="*70)
-
-        # 用工厂函数确保每次重复实验都拿到全新的压缩器实例
-        algorithms = {
-            "1. Baseline (Dense)": lambda: None,
-            "2. StreamingLLM (Cap=512)": lambda: StreamingLLMCompressor(window_size=508, sink_size=4),
-            "3. H2O (Cap=512)": lambda: H2OCompressor(max_capacity=512, window_size=32, sink_size=4),
-            "4. SnapKV (Ratio=0.5)": lambda: SnapKVCompressor(compression_ratio=0.5, window_size=32, kernel_size=5, sink_size=4),
-        }
 
         dataset_results = {}
 
         for context_length in context_lengths:
-            print("\n" + "~"*70)
+            print("\n")
             print(f"当前上下文长度: {context_length} tokens")
-            print("~"*70)
 
             test_text = fetch_test_text(loader, tokenizer, context_length)
             context_results = {}
+            current_capacity = max(
+                int(context_length * compression_ratio),
+                window_size + sink_size,
+            )
 
-            # 3. 内层循环：遍历并测试不同压缩算法
+            algorithms = {
+                "1. Baseline (Dense)": lambda: None,
+                f"2. StreamingLLM (Ratio={compression_ratio}, Cap={current_capacity})": (
+                    lambda: StreamingLLMCompressor(
+                        window_size=current_capacity - sink_size,
+                        sink_size=sink_size,
+                    )
+                ),
+                f"3. H2O (Ratio={compression_ratio}, Cap={current_capacity})": (
+                    lambda: H2OCompressor(
+                        max_capacity=current_capacity,
+                        window_size=window_size,
+                        sink_size=sink_size,
+                    )
+                ),
+                f"4. SnapKV (Ratio={compression_ratio}, Cap={current_capacity})": (
+                    lambda: SnapKVCompressor(
+                        max_capacity=current_capacity,
+                        window_size=window_size,
+                        kernel_size=kernel_size,
+                        sink_size=sink_size,
+                    )
+                ),
+            }
+
+            # 3. 遍历并测试不同压缩算法
             for algo_name, compressor_factory in algorithms.items():
-                print("\n" + "-"*50)
+                print("\n")
                 print(f"当前评估算法: {algo_name}")
-                print("-"*50)
                 run_results = []
 
-                for repeat_idx in range(benchmark_repeats):
-                    if discard_first_measurement:
-                        _ = run_single_benchmark(
-                            model_id=model_id,
-                            device=device,
-                            tokenizer=tokenizer,
-                            test_text=test_text,
-                            compressor_factory=compressor_factory,
-                            gen_length=gen_length,
-                        )
-                        discard_first_measurement = False
+                _ = run_single_benchmark(
+                    model_id=model_id,
+                    device=device,
+                    tokenizer=tokenizer,
+                    test_text=test_text,
+                    compressor_factory=compressor_factory,
+                    gen_length=gen_length,
+                )
 
+                for repeat_idx in range(benchmark_repeats):
                     print(f"重复测试 {repeat_idx + 1}/{benchmark_repeats}")
 
                     results = run_single_benchmark(
@@ -278,16 +277,13 @@ def main():
 
             dataset_results[context_length] = context_results
             
-        # 记录当前数据集测试结果
         super_results[dataset_name] = dataset_results
 
 
-    # 4. 打印汇总对比表格
-    print("\n\n" + "="*90)
+    # 4. 生成报告表格
+    print("\n\n")
     print(" "*35 + "最终 Benchmark 汇总报告")
-    print("="*90)
     
-    # 遍历打印每个数据集的测试数据
     for dataset_name, dataset_results in super_results.items():
         print(f"\n数据集: {dataset_name}")
         for context_length, context_results in dataset_results.items():

@@ -15,17 +15,7 @@ class Evaluator:
 
     @torch.no_grad()
     def calculate_ppl(self, input_ids, step_size=1):
-        """
-        按自回归解码路径计算 PPL。
-
-        不能直接用 `model(input_ids, labels=input_ids)`：
-        那种整段前向虽然会返回被压缩后的 past_key_values，
-        但本次 logits 已经基于未压缩的注意力结果算完了，
-        因此不同 KV 压缩方法会得到几乎完全相同的 PPL。
-
-        这里改为逐步喂入 token / token chunk，并显式复用 past_key_values，
-        让后续 token 的预测真正受到 KV cache 压缩的影响。
-        """
+        # 按自回归解码路径计算 PPL
         if input_ids.dim() == 1:
             input_ids = input_ids.unsqueeze(0)
 
@@ -71,7 +61,7 @@ class Evaluator:
         next_token = torch.argmax(next_token_logits, dim=-1)
         ttft = time.perf_counter() - start_ttft
 
-        past_key_values = outputs.past_key_values   # outputs.past_key_values已包含生成的新token的信息
+        past_key_values = outputs.past_key_values
         current_input_ids = next_token.unsqueeze(0)
 
         # 记录 TPOT (Time Per Output Token)
